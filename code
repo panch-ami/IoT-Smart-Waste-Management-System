@@ -1,0 +1,202 @@
+# main.py - IoT Smart Waste Management System
+import time
+import machine
+import network
+import usocket as socket
+import utime
+
+## 1. Configuration Constants 
+# --- ThingSpeak & Wi-Fi Settings ---
+# *** Replace these with your actual credentials ***
+WIFI_SSID = "Realme C55 (P)"
+WIFI_PASSWORD = "x5hruftj"
+CHANNEL_ID = 3180158  # Your ThingSpeak Channel ID
+WRITE_API_KEY = "NQTWRB3HRAON2M9T" # Your ThingSpeak Write API Key
+THINGSPEAK_HOST = "api.thingspeak.com"
+THINGSPEAK_PORT = 80 # Standard HTTP port
+
+# --- Sensor and Bin Settings ---
+# Pin assignments (adjust if needed for your setup)
+TRIG_PIN = 27
+ECHO_PIN = 28
+# Bin depth (distance from sensor to the bottom of the empty bin, in cm)
+MAX_DISTANCE_CM = 30.0 
+# Time in seconds to wait between ThingSpeak updates (must be > 15s)
+THINGSPEAK_UPDATE_INTERVAL = 20
+
+# --- Output Pins (LEDs and Buzzer) ---
+GREEN_LED_PIN = 12  # Up to 75% filled
+YELLOW_LED_PIN = 13 # >75% to <90% filled
+RED_LED_PIN = 14    # >=90% filled
+BUZZER_PIN = 21
+
+# Pin Initialization
+trig = machine.Pin(TRIG_PIN, machine.Pin.OUT)
+echo = machine.Pin(ECHO_PIN, machine.Pin.IN)
+green_led = machine.Pin(GREEN_LED_PIN, machine.Pin.OUT)
+yellow_led = machine.Pin(YELLOW_LED_PIN, machine.Pin.OUT)
+red_led = machine.Pin(RED_LED_PIN, machine.Pin.OUT)
+# --- FIX: Set initial value=1 to keep the Active-LOW buzzer OFF ---
+buzzer = machine.Pin(BUZZER_PIN, machine.Pin.OUT, value=1) 
+
+# Global variables
+current_distance_cm = 0.0 # Distance from sensor to material (empty space)
+filled_percentage = 0.0   # How full the bin is
+
+## 2. Helper Functions
+
+def connect_to_wifi():
+    """Connects the Pico W to the specified Wi-Fi network."""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print(f"Connecting to Wi-Fi network: {WIFI_SSID}...")
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        
+        max_wait = 10
+        while max_wait > 0:
+            if wlan.isconnected():
+                break
+            max_wait -= 1
+            print('.', end='')
+            utime.sleep(1)
+            
+        if wlan.isconnected():
+            print("\nConnected! Network config:", wlan.ifconfig())
+        else:
+            print("\nWi-Fi connection failed. Check SSID/Password.")
+            
+    return wlan
+
+def measure_distance():
+    """Measures the distance using the HC-SR04 sensor and returns distance in cm."""
+    # Send 10us pulse
+    trig.value(0)
+    utime.sleep_us(2)
+    trig.value(1)
+    utime.sleep_us(10)
+    trig.value(0)
+    
+    # Measure duration
+    pulse_start = utime.ticks_us()
+    timeout_start = utime.ticks_ms()
+    while echo.value() == 0:
+        if utime.ticks_diff(utime.ticks_ms(), timeout_start) > 50: # 50ms timeout
+            return MAX_DISTANCE_CM
+        pulse_start = utime.ticks_us()
+
+    pulse_end = utime.ticks_us()
+    timeout_start = utime.ticks_ms()
+    while echo.value() == 1:
+        if utime.ticks_diff(utime.ticks_ms(), timeout_start) > 50:
+            return MAX_DISTANCE_CM
+        pulse_end = utime.ticks_us()
+        
+    duration_us = utime.ticks_diff(pulse_end, pulse_start)
+    
+    # Distance (cm) = (duration_us / 58.0) 
+    distance_cm = (duration_us / 58.0) 
+    
+    # Clamp the distance
+    if distance_cm > MAX_DISTANCE_CM:
+        distance_cm = MAX_DISTANCE_CM
+    elif distance_cm < 0:
+        distance_cm = 0.0
+        
+    return distance_cm
+
+def update_leds_and_buzzer(filled_percent):
+    """Controls the LEDs and buzzer based on the filled level percentage."""
+    # Turn all off first
+    green_led.value(0)
+    yellow_led.value(0)
+    red_led.value(0)
+    
+    # Buzzer OFF state is 1 (HIGH) for Active-LOW module
+    buzzer.value(1) 
+    
+    if filled_percent >= 90:
+        # RED: 90% and above - ALARM!
+        red_led.value(1)
+        # Buzzer ON state is 0 (LOW) for Active-LOW module
+        buzzer.value(0) 
+        print("🚨 CRITICAL: Bin >= 90% Full! 🚨")
+    elif filled_percent >= 75:
+        # YELLOW: 75% to <90% - WARNING
+        yellow_led.value(1)
+        print("⚠️ WARNING: Bin >= 75% Full.")
+    else:
+        # GREEN: Up to 75% - OK
+        green_led.value(1)
+        print("✅ OK: Bin < 75% Full.")
+
+def send_to_thingspeak(field1_value, field2_value):
+    """
+    Sends data to ThingSpeak.
+    Field 1: Filled Percentage (%).
+    Field 2: Distance to Material (cm).
+    """
+    try:
+        addr = socket.getaddrinfo(THINGSPEAK_HOST, THINGSPEAK_PORT)[0][-1]
+        s = socket.socket()
+        s.connect(addr)
+        
+        # Construct the URL to send Field 1 (Filled %) and Field 2 (Distance cm)
+        url = f"/update?api_key={WRITE_API_KEY}&field1={field1_value}&field2={field2_value}"
+        
+        request = f"GET {url} HTTP/1.1\r\nHost: {THINGSPEAK_HOST}\r\n\r\n"
+        
+        s.send(bytes(request, 'utf8'))
+        s.close()
+        print("-" * 30)
+        print("📊 ThingSpeak Update Success! ")
+        print(f"  Field 1 (Filled %): {field1_value:.2f}%")
+        print(f"  Field 2 (Distance cm): {field2_value:.2f} cm")
+        
+    except Exception as e:
+        print(f"ThingSpeak Connection Error: {e}")
+        
+## 3. Main Loop Logic
+
+def main_loop():
+    """Main execution loop for sensing, calculation, and output."""
+    global current_distance_cm, filled_percentage
+    
+    wlan = connect_to_wifi()
+    if not wlan.isconnected():
+        print("Exiting main loop due to Wi-Fi failure.")
+        return
+
+    last_thingspeak_time = utime.time()
+    
+    while True:
+        # --- Sensor Measurement and Calculation ---
+        current_distance_cm = measure_distance() 
+        
+        # 1. Calculate filled distance (how much waste is in the bin)
+        filled_distance_cm = MAX_DISTANCE_CM - current_distance_cm
+        
+        # 2. Calculate filled percentage
+        filled_percentage = (filled_distance_cm / MAX_DISTANCE_CM) * 100.0
+        
+        # --- Console Output ---
+        print("-" * 30)
+        print(f"**Filled Distance (cm): {filled_distance_cm:.2f}**")
+        print(f"**Filled Percentage (%): {filled_percentage:.2f}%**")
+        
+        # --- Output Control (LEDs/Buzzer) ---
+        update_leds_and_buzzer(filled_percentage)
+        
+        # --- ThingSpeak Update ---
+        if utime.time() - last_thingspeak_time >= THINGSPEAK_UPDATE_INTERVAL:
+            # Send Field 1 (Filled %) and Field 2 (Distance to Material)
+            send_to_thingspeak(filled_percentage, current_distance_cm) 
+            last_thingspeak_time = utime.time()
+            
+        utime.sleep(2) # Wait 2 seconds before the next measurement
+
+# Start the main program
+if __name__ == '__main__':
+    print("--- IoT Smart Waste Management System Starting ---")
+    main_loop()
+
