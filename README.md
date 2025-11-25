@@ -25,6 +25,6 @@ Pushbullet (to send notifications to your phone)
 
 APIs / Keys Needed:
 ThingSpeak Write API Key
-
-
 Pushbullet Access Token
+
+link for video demo: https://drive.google.com/file/d/1OCPpYZi_AXL-ZY0VLwDhxcF5qh67F0lh/view?usp=sharing
